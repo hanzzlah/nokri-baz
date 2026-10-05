@@ -233,7 +233,7 @@ def sync_jobs_to_db():
         with conn.cursor() as cursor:
             
             # 2. Fetch existing job IDs into a local set for O(1) lookups
-            cursor.execute("SELECT id FROM jobs;")
+            cursor.execute("SELECT id FROM RAW.punjab_jobs_portal;")
             existing_ids = {row[0] for row in cursor.fetchall()}
             
             # 3. Fetch current listings from the main portal (using previous function)
@@ -291,7 +291,7 @@ def sync_jobs_to_db():
             
             # 6. Execute Bulk UPSERT (Safeguard for modified records)
             insert_query = f"""
-                INSERT INTO jobs ({', '.join(columns)})
+                INSERT INTO RAW.punjab_jobs_portal ({', '.join(columns)})
                 VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
                     last_date_to_apply = EXCLUDED.last_date_to_apply,
