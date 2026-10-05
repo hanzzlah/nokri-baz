@@ -64,9 +64,11 @@ Before running the scraper, you must ensure the target table exists in your data
 Go to your Supabase SQL Editor and execute the following schema to create the `jobs` table:
 
 ```sql
+CREATE SCHEMA IF NOT EXISTS RAW;
+CREATE SCHEMA IF NOT EXISTS MARTS;
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TABLE jobs (
+CREATE TABLE RAW.punjab_jobs_portal (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     description TEXT,
