@@ -23,7 +23,7 @@ Follow these steps to set up and run the project locally.
 Open your terminal and clone the repository to your local machine:
 ```bash
 git clone https://github.com/hanzzlah/nokri-baz.git
-cd nokri-baz-scraper
+cd nokri-baz
 ```
 
 ### 2. Create a Virtual Environment
