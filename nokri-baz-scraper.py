@@ -290,15 +290,38 @@ def sync_jobs_to_db():
                 ))
             
             # 6. Execute Bulk UPSERT (Safeguard for modified records)
-            insert_query = f"""
-                INSERT INTO RAW.punjab_jobs_portal ({', '.join(columns)})
-                VALUES %s
-                ON CONFLICT (id) DO UPDATE SET
-                    last_date_to_apply = EXCLUDED.last_date_to_apply,
-                    total_positions = EXCLUDED.total_positions;
+            cursor.execute("""
+                CREATE TEMP TABLE staging_jobs 
+                (LIKE RAW.punjab_jobs_portal INCLUDING DEFAULTS) 
+                ON COMMIT DROP;
+            """)
+
+            # 2. Bulk insert scraped batch into staging
+            insert_staging_query = f"""
+                INSERT INTO staging_jobs ({', '.join(columns)})
+                VALUES %s;
             """
-            
-            execute_values(cursor, insert_query, values_list)
+            execute_values(cursor, insert_staging_query, values_list)
+
+            # 3. Execute atomic MERGE
+            merge_query = f"""
+                MERGE INTO RAW.punjab_jobs_portal AS target
+                USING staging_jobs AS source
+                ON target.id = source.id
+                WHEN MATCHED THEN
+                    UPDATE SET 
+                        title = source.title,
+                        description = source.description,
+                        total_positions = source.total_positions,
+                        last_date_to_apply = source.last_date_to_apply,
+                        is_active = TRUE
+                WHEN NOT MATCHED BY TARGET THEN
+                    INSERT ({', '.join(columns)})
+                    VALUES ({', '.join(['source.' + col for col in columns])})
+                WHEN NOT MATCHED BY SOURCE THEN
+                    UPDATE SET is_active = FALSE;
+            """
+            cursor.execute(merge_query)
             print(f"Successfully synced {len(values_list)} new jobs.")
             
         conn.commit()
