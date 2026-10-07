@@ -217,11 +217,25 @@ def fetch_single_detail(job_id, url):
     return parsed_data
 
 def sync_jobs_to_db():
-    # 1. Establish Database Connection
-    pg_set = os.getenv("DB_HOST") and os.getenv("DB_PORT") and os.getenv("DB_NAME") and os.getenv("DB_USER") and os.getenv("DB_PASS")
+    # 1. Verify Environment Variables
+    pg_set = all([
+        os.getenv("DB_HOST"), os.getenv("DB_PORT"), 
+        os.getenv("DB_NAME"), os.getenv("DB_USER"), os.getenv("DB_PASS")
+    ])
     if not pg_set:
-        raise ValueError("One or more database environment variables are missing.")
+        raise ValueError("[ERROR] One or more database environment variables are missing.")
         
+    print("[INFO] Starting Punjab Jobs Portal synchronization...")
+
+    # 2. Fetch current listings from the live website
+    all_listings = fetch_job_listings()
+    current_site_map = {
+        job["href"].rstrip("/").rsplit("/", 1)[-1]: job["href"]
+        for job in all_listings
+    }
+    current_site_ids = set(current_site_map.keys())
+    print(f"[INFO] Fetched {len(current_site_ids)} active job IDs from portal.")
+
     with psycopg2.connect(
         host=os.getenv("DB_HOST"),
         port=os.getenv("DB_PORT"),
@@ -231,100 +245,97 @@ def sync_jobs_to_db():
         sslmode="require"
     ) as conn:
         with conn.cursor() as cursor:
-            
-            # 2. Fetch existing job IDs into a local set for O(1) lookups
-            cursor.execute("SELECT id FROM RAW.punjab_jobs_portal;")
-            existing_ids = {row[0] for row in cursor.fetchall()}
-            
-            # 3. Fetch current listings from the main portal (using previous function)
-            all_listings = fetch_job_listings()
-            
-            new_jobs = []
-            for job in all_listings:
-                # Extract ID directly from the trailing end of the URL
-                job_id = job["href"].rstrip("/").rsplit("/", 1)[-1]
-                if job_id not in existing_ids:
-                    new_jobs.append((job_id, job["href"]))
-            
-            if not new_jobs:
-                print("No new jobs to sync.")
-                return
-            
-            # 4. Fetch detail pages concurrently to maximize network performance
+            # 3. Fetch current database state (ID and active status)
+            cursor.execute("SELECT id, is_active FROM RAW.punjab_jobs_portal;")
+            db_records = dict(cursor.fetchall())  # {job_id: is_active}
+            existing_ids = set(db_records.keys())
+
+            # 4. Identify job categories
+            new_job_ids = current_site_ids - existing_ids
+            jobs_to_deactivate = {
+                j_id for j_id, is_active in db_records.items() 
+                if is_active and j_id not in current_site_ids
+            }
+            jobs_to_reactivate = {
+                j_id for j_id, is_active in db_records.items() 
+                if not is_active and j_id in current_site_ids
+            }
+
+            print(f"[INFO] Found {len(new_job_ids)} new job(s) to scrape.")
+            print(f"[INFO] Found {len(jobs_to_deactivate)} missing job(s) to deactivate.")
+            print(f"[INFO] Found {len(jobs_to_reactivate)} re-posted job(s) to reactivate.")
+
+            # 5. Scrape details for new jobs concurrently
             parsed_records = []
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                future_to_job = {
-                    executor.submit(fetch_single_detail, j_id, href): href 
-                    for j_id, href in new_jobs
-                }
+            if new_job_ids:
+                print(f"[INFO] Scraping details for {len(new_job_ids)} new jobs...")
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_job = {
+                        executor.submit(fetch_single_detail, j_id, current_site_map[j_id]): j_id 
+                        for j_id in new_job_ids
+                    }
+                    
+                    for future in as_completed(future_to_job):
+                        j_id = future_to_job[future]
+                        try:
+                            result = future.result()
+                            if result:
+                                parsed_records.append(result)
+                        except Exception as exc:
+                            print(f"[WARNING] Failed parsing details for job ID {j_id}: {exc}")
+
+            # 6. Bulk Insert New Records (UPSERT)
+            if parsed_records:
+                columns = [
+                    "id", "title", "description", "education_level_years", "degree_area",
+                    "district", "division", "industry", "project", "total_positions",
+                    "employment_status", "role", "job_posted", "last_date_to_apply",
+                    "level", "years_of_experience", "age_min", "age_max", "gender",
+                    "monthly_salary_min", "monthly_salary_max"
+                ]
                 
-                for future in as_completed(future_to_job):
-                    try:
-                        parsed_records.append(future.result())
-                    except Exception as exc:
-                        href = future_to_job[future]
-                        print(f"Failed parsing {href}: {exc}")
-            
-            if not parsed_records:
-                return
+                values_list = [
+                    (
+                        r["id"], r["title"], r["description"], r["education_level_years"],
+                        r["degree_area"], r["district"], r["division"], r["industry"],
+                        r["project"], r["total_positions"], r["employment_status"],
+                        r["role"], r["job_posted"], r["last_date_to_apply"], r["level"],
+                        json.dumps(r["years_of_experience"]) if r["years_of_experience"] else None,
+                        r["age_min"], r["age_max"], r["gender"],
+                        r["monthly_salary_min"], r["monthly_salary_max"]
+                    ) for r in parsed_records
+                ]
 
-            # 5. Prepare data for Bulk Insert
-            columns = [
-                "id", "title", "description", "education_level_years", "degree_area",
-                "district", "division", "industry", "project", "total_positions",
-                "employment_status", "role", "job_posted", "last_date_to_apply",
-                "level", "years_of_experience", "age_min", "age_max", "gender",
-                "monthly_salary_min", "monthly_salary_max"
-            ]
-            
-            values_list = []
-            for r in parsed_records:
-                values_list.append((
-                    r["id"], r["title"], r["description"], r["education_level_years"],
-                    r["degree_area"], r["district"], r["division"], r["industry"],
-                    r["project"], r["total_positions"], r["employment_status"],
-                    r["role"], r["job_posted"], r["last_date_to_apply"], r["level"],
-                    json.dumps(r["years_of_experience"]) if r["years_of_experience"] else None,
-                    r["age_min"], r["age_max"], r["gender"],
-                    r["monthly_salary_min"], r["monthly_salary_max"]
-                ))
-            
-            # 6. Execute Bulk UPSERT (Safeguard for modified records)
-            cursor.execute("""
-                CREATE TEMP TABLE staging_jobs 
-                (LIKE RAW.punjab_jobs_portal INCLUDING DEFAULTS) 
-                ON COMMIT DROP;
-            """)
+                upsert_query = f"""
+                    INSERT INTO RAW.punjab_jobs_portal ({', '.join(columns)})
+                    VALUES %s
+                    ON CONFLICT (id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        description = EXCLUDED.description,
+                        total_positions = EXCLUDED.total_positions,
+                        last_date_to_apply = EXCLUDED.last_date_to_apply,
+                        is_active = TRUE;
+                """
+                execute_values(cursor, upsert_query, values_list)
+                print(f"[SUCCESS] Inserted {len(values_list)} new records into database.")
 
-            # 2. Bulk insert scraped batch into staging
-            insert_staging_query = f"""
-                INSERT INTO staging_jobs ({', '.join(columns)})
-                VALUES %s;
-            """
-            execute_values(cursor, insert_staging_query, values_list)
+            # 7. Soft Delete (Deactivate) Missing Jobs
+            if jobs_to_deactivate:
+                cursor.execute(
+                    "UPDATE RAW.punjab_jobs_portal SET is_active = FALSE WHERE id = ANY(%s);",
+                    (list(jobs_to_deactivate),)
+                )
+                print(f"[SUCCESS] Deactivated {len(jobs_to_deactivate)} obsolete jobs.")
 
-            # 3. Execute atomic MERGE
-            merge_query = f"""
-                MERGE INTO RAW.punjab_jobs_portal AS target
-                USING staging_jobs AS source
-                ON target.id = source.id
-                WHEN MATCHED THEN
-                    UPDATE SET 
-                        title = source.title,
-                        description = source.description,
-                        total_positions = source.total_positions,
-                        last_date_to_apply = source.last_date_to_apply,
-                        is_active = TRUE
-                WHEN NOT MATCHED BY TARGET THEN
-                    INSERT ({', '.join(columns)})
-                    VALUES ({', '.join(['source.' + col for col in columns])})
-                WHEN NOT MATCHED BY SOURCE THEN
-                    UPDATE SET is_active = FALSE;
-            """
-            cursor.execute(merge_query)
-            print(f"Successfully synced {len(values_list)} new jobs.")
-            
-        conn.commit()
+            # 8. Reactivate Re-posted Jobs
+            if jobs_to_reactivate:
+                cursor.execute(
+                    "UPDATE RAW.punjab_jobs_portal SET is_active = TRUE WHERE id = ANY(%s);",
+                    (list(jobs_to_reactivate),)
+                )
+                print(f"[SUCCESS] Reactivated {len(jobs_to_reactivate)} re-posted jobs.")
+
+    print("[INFO] Synchronization completed successfully.")
 
 if __name__ == "__main__":
     sync_jobs_to_db()
