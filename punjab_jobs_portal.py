@@ -5,6 +5,8 @@ import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from utils.embedder import get_embeddings
+
 import psycopg2
 import requests as req
 from dotenv import load_dotenv
@@ -211,13 +213,11 @@ def fetch_single_detail(job_id, url):
     resp = req.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     
-    # parse_job_details was defined in the earlier steps
     parsed_data = parse_job_details(resp.text, url)
-    parsed_data["id"] = job_id  # Enforce ID from main page
+    parsed_data["id"] = job_id  
     return parsed_data
 
 def sync_jobs_to_db():
-    # 1. Verify Environment Variables
     pg_set = all([
         os.getenv("DB_HOST"), os.getenv("DB_PORT"), 
         os.getenv("DB_NAME"), os.getenv("DB_USER"), os.getenv("DB_PASS")
@@ -227,7 +227,6 @@ def sync_jobs_to_db():
         
     print("[INFO] Starting Punjab Jobs Portal synchronization...")
 
-    # 2. Fetch current listings from the live website
     all_listings = fetch_job_listings()
     current_site_map = {
         job["href"].rstrip("/").rsplit("/", 1)[-1]: job["href"]
@@ -245,12 +244,10 @@ def sync_jobs_to_db():
         sslmode="require"
     ) as conn:
         with conn.cursor() as cursor:
-            # 3. Fetch current database state (ID and active status)
             cursor.execute("SELECT id, is_active FROM RAW.punjab_jobs_portal;")
-            db_records = dict(cursor.fetchall())  # {job_id: is_active}
+            db_records = dict(cursor.fetchall())
             existing_ids = set(db_records.keys())
 
-            # 4. Identify job categories
             new_job_ids = current_site_ids - existing_ids
             jobs_to_deactivate = {
                 j_id for j_id, is_active in db_records.items() 
@@ -265,7 +262,6 @@ def sync_jobs_to_db():
             print(f"[INFO] Found {len(jobs_to_deactivate)} missing job(s) to deactivate.")
             print(f"[INFO] Found {len(jobs_to_reactivate)} re-posted job(s) to reactivate.")
 
-            # 5. Scrape details for new jobs concurrently
             parsed_records = []
             if new_job_ids:
                 print(f"[INFO] Scraping details for {len(new_job_ids)} new jobs...")
@@ -284,7 +280,6 @@ def sync_jobs_to_db():
                         except Exception as exc:
                             print(f"[WARNING] Failed parsing details for job ID {j_id}: {exc}")
 
-            # 6. Bulk Insert New Records (UPSERT)
             if parsed_records:
                 columns = [
                     "id", "title", "description", "education_level_years", "degree_area",
@@ -319,7 +314,6 @@ def sync_jobs_to_db():
                 execute_values(cursor, upsert_query, values_list)
                 print(f"[SUCCESS] Inserted {len(values_list)} new records into database.")
 
-            # 7. Soft Delete (Deactivate) Missing Jobs
             if jobs_to_deactivate:
                 cursor.execute(
                     "UPDATE RAW.punjab_jobs_portal SET is_active = FALSE WHERE id = ANY(%s);",
@@ -327,13 +321,42 @@ def sync_jobs_to_db():
                 )
                 print(f"[SUCCESS] Deactivated {len(jobs_to_deactivate)} obsolete jobs.")
 
-            # 8. Reactivate Re-posted Jobs
             if jobs_to_reactivate:
                 cursor.execute(
                     "UPDATE RAW.punjab_jobs_portal SET is_active = TRUE WHERE id = ANY(%s);",
                     (list(jobs_to_reactivate),)
                 )
                 print(f"[SUCCESS] Reactivated {len(jobs_to_reactivate)} re-posted jobs.")
+
+            affected_ids = [r["id"] for r in parsed_records] + list(jobs_to_reactivate)
+            
+            if affected_ids:
+                marts_ids = [f"punjab-{j_id}" for j_id in affected_ids]
+                
+                cursor.execute("""
+                    SELECT id, search_text 
+                    FROM MARTS.jobs 
+                    WHERE id = ANY(%s) AND embedding IS NULL AND search_text IS NOT NULL;
+                """, (marts_ids,))
+                
+                rows = cursor.fetchall()
+                if rows:
+                    print(f"[INFO] Generating embeddings for {len(rows)} Punjab jobs...")
+                    job_ids = [r[0] for r in rows]
+                    texts = [r[1] for r in rows]
+                    
+                    embeddings = get_embeddings(texts)
+                    
+                    update_data = [(j_id, emb) for j_id, emb in zip(job_ids, embeddings)]
+                    
+                    update_query = """
+                        UPDATE MARTS.jobs AS m
+                        SET embedding = v.embedding::vector
+                        FROM (VALUES %s) AS v(id, embedding)
+                        WHERE m.id = v.id;
+                    """
+                    execute_values(cursor, update_query, update_data)
+                    print(f"[SUCCESS] Updated embeddings for {len(update_data)} Punjab jobs in MARTS.jobs.")
 
     print("[INFO] Synchronization completed successfully.")
 

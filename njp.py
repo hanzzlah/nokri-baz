@@ -2,6 +2,8 @@ import re
 import os
 from datetime import datetime
 
+from utils.embedder import get_embeddings
+
 import psycopg2
 import cloudscraper
 from lxml import html
@@ -151,6 +153,33 @@ def main():
                     (list(ids_to_deactivate),)
                 )
                 print(f"Deactivated {len(ids_to_deactivate)} records.")
+
+            if new_data:
+                marts_ids = [f"njp-{r['id']}" for r in new_data]
+                
+                cursor.execute("""
+                    SELECT id, search_text 
+                    FROM MARTS.jobs 
+                    WHERE id = ANY(%s) AND embedding IS NULL AND search_text IS NOT NULL;
+                """, (marts_ids,))
+                
+                rows = cursor.fetchall()
+                if rows:
+                    print(f"Generating embeddings for {len(rows)} NJP jobs...")
+                    job_ids = [r[0] for r in rows]
+                    texts = [r[1] for r in rows]
+                    
+                    embeddings = get_embeddings(texts)
+                    update_data = [(j_id, emb) for j_id, emb in zip(job_ids, embeddings)]
+                    
+                    update_query = """
+                        UPDATE MARTS.jobs AS m
+                        SET embedding = v.embedding::vector
+                        FROM (VALUES %s) AS v(id, embedding)
+                        WHERE m.id = v.id;
+                    """
+                    execute_values(cursor, update_query, update_data)
+                    print(f"Successfully updated embeddings for {len(update_data)} NJP jobs in MARTS.jobs.")
 
     conn.close()
 
