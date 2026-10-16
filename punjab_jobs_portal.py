@@ -3,7 +3,6 @@ import re
 import json
 import time
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils.embedder import get_embeddings
 
@@ -15,17 +14,46 @@ from psycopg2.extras import execute_values
 
 load_dotenv()
 
-def fetch_job_listings(
-    url: str = "https://jobs.punjab.gov.pk/new_recruit/jobs",
-) -> list[dict[str, str]]:
+def fetch_via_scraperapi(target_url: str) -> bytes:
+    """Routes the request through ScraperAPI with retries for dropped connections."""
+    api_key = os.getenv("SCRAPER_API_KEY")
+    if not api_key:
+        raise ValueError("SCRAPER_API_KEY is missing from environment variables.")
+        
+    proxy_url = "https://api.scraperapi.com/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     }
+    payload = {
+        'api_key': api_key,
+        'url': target_url,
+        'premium': 'true',        
+        'country_code': 'pk',     
+        'render': 'true',         
+        'keep_headers': 'true'
+    }
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = req.get(proxy_url, headers=headers, params=payload, timeout=90)
+            if response.status_code == 200:
+                return response.content
+            print(f"[WARNING] ScraperAPI returned Status {response.status_code}. Retrying...")
+            time.sleep(3)
+        except req.exceptions.RequestException as e:
+            print(f"[WARNING] Network error: {e}. Retrying...")
+            time.sleep(3)
+            
+    raise Exception(f"[ERROR] Failed to fetch {target_url} after {max_retries} attempts.")
 
-    response = req.get(url, headers=headers, timeout=15)
-    response.raise_for_status()
-
-    soup = bs(response.content, "html.parser")
+def fetch_job_listings(
+    url: str = "https://jobs.punjab.gov.pk/new_recruit/jobs",
+) -> list[dict[str, str]]:
+    
+    print("[INFO] Fetching main job listings page...")
+    content = fetch_via_scraperapi(url)
+    soup = bs(content, "html.parser")
     rows = soup.select("table tbody tr")
 
     jobs_data = []
@@ -39,7 +67,7 @@ def fetch_job_listings(
 
     return jobs_data
 
-def parse_job_details(html_content: str, url: str | None = None) -> dict:
+def parse_job_details(html_content: bytes, url: str | None = None) -> dict:
     soup = bs(html_content, "html.parser")
 
     # 1. Job ID (from URL or fallback to saveJob onclick function in HTML)
@@ -205,15 +233,9 @@ def parse_job_details(html_content: str, url: str | None = None) -> dict:
     }
 
 def fetch_single_detail(job_id, url):
-    """Worker function for threading: fetches and parses a single detail page."""
-    time.sleep(0.5)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    }
-    resp = req.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    
-    parsed_data = parse_job_details(resp.text, url)
+    """Fetches and parses a single detail page sequentially."""
+    content = fetch_via_scraperapi(url)
+    parsed_data = parse_job_details(content, url)
     parsed_data["id"] = job_id  
     return parsed_data
 
@@ -264,21 +286,19 @@ def sync_jobs_to_db():
 
             parsed_records = []
             if new_job_ids:
-                print(f"[INFO] Scraping details for {len(new_job_ids)} new jobs...")
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    future_to_job = {
-                        executor.submit(fetch_single_detail, j_id, current_site_map[j_id]): j_id 
-                        for j_id in new_job_ids
-                    }
+                print(f"[INFO] Scraping details for {len(new_job_ids)} new jobs sequentially...")
+                # Process sequentially instead of threaded to prevent ScraperAPI 500 limits
+                for idx, j_id in enumerate(new_job_ids, 1):
+                    print(f"[{idx}/{len(new_job_ids)}] Fetching job ID: {j_id}")
+                    try:
+                        result = fetch_single_detail(j_id, current_site_map[j_id])
+                        if result:
+                            parsed_records.append(result)
+                    except Exception as exc:
+                        print(f"[WARNING] Failed parsing details for job ID {j_id}: {exc}")
                     
-                    for future in as_completed(future_to_job):
-                        j_id = future_to_job[future]
-                        try:
-                            result = future.result()
-                            if result:
-                                parsed_records.append(result)
-                        except Exception as exc:
-                            print(f"[WARNING] Failed parsing details for job ID {j_id}: {exc}")
+                    if idx < len(new_job_ids):
+                        time.sleep(2) # Prevent rate-limiting from ScraperAPI
 
             if parsed_records:
                 columns = [
